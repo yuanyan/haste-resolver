@@ -1,0 +1,2 @@
+# haste-resolver
+Haste Resolver
