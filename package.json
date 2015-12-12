@@ -1,0 +1,28 @@
+{
+  "name": "haste-resolver",
+  "version": "0.0.1",
+  "description": "Haste Resolver",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "keywords": [
+    "react",
+    "react-native",
+    "haste"
+  ],
+  "scripts": {
+    "prepublish": "babel ./src --out-dir ./lib"
+  },
+  "dependencies": {
+    "absolute-path": "0.0.0",
+    "debug": "~2.2.0",
+    "graceful-fs": "~4.1.2",
+    "joi": "~6.6.1",
+    "promise": "~7.0.4",
+    "underscore": "~1.8.3"
+  },
+  "devDependencies": {
+    "babel": "5.8.19"
+  }
+}
