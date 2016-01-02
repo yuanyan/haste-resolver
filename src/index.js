@@ -10,58 +10,29 @@
 
 var path = require('path');
 var DependencyGraph = require('./DependencyGraph');
-var declareOpts = require('./utils/declareOpts');
 var Promise = require('promise');
 
-var validateOpts = declareOpts({
-  projectRoots: {
-    type: 'array',
-    required: true,
-  },
-  blacklistRE: {
-    type: 'object', // typeof regex is object
-  },
-  nonPersistent: {
-    type: 'boolean',
-    default: false,
-  },
-  moduleFormat: {
-    type: 'string',
-    default: 'haste',
-  },
-  providesModuleNodeModules: {
-    type: 'array',
-    default: [
-      'react-tools',
-      'react-native',
-      '@ali',
-      '@alife'
-    ],
-  },
-});
-
-function HasteDependencyResolver(options) {
-  var opts = validateOpts(options);
+function HasteDependencyResolver({
+  roots,
+  blacklistRE,
+  providesModuleNodeModules,
+  platform,
+  preferNativePlatform,
+}) {
 
   this._depGraph = new DependencyGraph({
-    roots: opts.projectRoots,
+    roots: roots,
     ignoreFilePath: function(filepath) {
       return filepath.indexOf('__tests__') !== -1 ||
-        (opts.blacklistRE && opts.blacklistRE.test(filepath));
+        (blacklistRE && blacklistRE.test(filepath));
     },
-    providesModuleNodeModules: opts.providesModuleNodeModules,
+    providesModuleNodeModules: providesModuleNodeModules,
+    platform: platform,
+    preferNativePlatform, preferNativePlatform
   });
 }
 
-var getDependenciesValidateOpts = declareOpts({
-  dev: {
-    type: 'boolean',
-    default: true,
-  },
-});
-
 HasteDependencyResolver.prototype.getDependencies = function(main, options) {
-  var opts = getDependenciesValidateOpts(options);
 
   var depGraph = this._depGraph;
   var self = this;

@@ -1,4 +1,5 @@
 /**
+ * Copyright (c) 2015-present, Yuanyan Cao. All rights reserved.
  * Copyright (c) 2015-present, Facebook, Inc.
  * All rights reserved.
  *
@@ -14,28 +15,24 @@ const Promise = require('promise');
 const _ = require('underscore');
 const crawl = require('../crawlers');
 const debug = require('debug')('DependencyGraph');
-const declareOpts = require('../utils/declareOpts');
 const isAbsolutePath = require('absolute-path');
 const path = require('path');
 const util = require('util');
 
-const validateOpts = declareOpts({
-  roots: {
-    type: 'array',
-    required: true,
-  },
-  ignoreFilePath: {
-    type: 'function',
-    default: function(){}
-  },
-  providesModuleNodeModules: {
-    type: 'array'
-  },
-});
-
 class DependencyGraph {
-  constructor(options) {
-    this._opts = validateOpts(options);
+  constructor({
+    roots,
+    platform,
+    preferNativePlatform,
+    ignoreFilePath,
+    providesModuleNodeModules,
+  }) {
+    this._roots = roots;
+    this._platform = platform;
+    this._preferNativePlatform = preferNativePlatform;
+    this._providesModuleNodeModules = providesModuleNodeModules;
+    this._ignoreFilePath = ignoreFilePath || function(){};
+
     this._hasteMap = Object.create(null);
     this._immediateResolutionCache = Object.create(null);
     this.load();
@@ -47,16 +44,16 @@ class DependencyGraph {
     }
 
     var startTime = new Date;
-    const allRoots = this._opts.roots;
+    const allRoots = this._roots;
     this._crawling = crawl(allRoots, {
-      ignore: this._opts.ignoreFilePath,
+      ignore: this._ignoreFilePath,
       exts: ['js', 'json']
     });
 
     this._crawling.then((files) => console.log('Crawl:', (new Date - startTime) + 'ms'));
 
-    this._fastfs = new Fastfs(this._opts.roots, {
-      ignore: this._opts.ignoreFilePath,
+    this._fastfs = new Fastfs(this._roots, {
+      ignore: this._ignoreFilePath,
       crawling: this._crawling,
     });
 
@@ -131,7 +128,7 @@ class DependencyGraph {
         throw new NotFoundError(
           'Cannot find entry file %s in any of the roots: %j',
           entryPath,
-          this._opts.roots
+          this._roots
         );
       }
 
@@ -181,8 +178,8 @@ class DependencyGraph {
       return filePath;
     }
 
-    for (let i = 0; i < this._opts.roots.length; i++) {
-      const root = this._opts.roots[i];
+    for (let i = 0; i < this._roots.length; i++) {
+      const root = this._roots[i];
       const absPath = path.join(root, filePath);
       if (this._fastfs.fileExists(absPath)) {
         return absPath;
@@ -224,8 +221,8 @@ class DependencyGraph {
           dep.root,
           path.relative(packageName, realModuleName)
         );
-        return this._loadAsFile(potentialModulePath)
-          .catch(() => this._loadAsDir(potentialModulePath));
+        return this._loadAsFile(potentialModulePath, fromModule, toModuleName)
+          .catch(() => this._loadAsDir(potentialModulePath, fromModule, toModuleName));
       }
 
       throw new Error('Unable to resolve dependency');
@@ -247,8 +244,8 @@ class DependencyGraph {
               toModuleName :
               path.join(path.dirname(fromModule.path), toModuleName);
       return this._redirectRequire(fromModule, potentialModulePath).then(
-        realModuleName => this._loadAsFile(realModuleName)
-          .catch(() => this._loadAsDir(realModuleName))
+        realModuleName => this._loadAsFile(realModuleName, fromModule, toModuleName)
+          .catch(() => this._loadAsDir(realModuleName, fromModule, toModuleName))
       );
     } else {
       return this._redirectRequire(fromModule, toModuleName).then(
@@ -265,9 +262,9 @@ class DependencyGraph {
           let p = Promise.reject(new Error('Node module not found'));
           searchQueue.forEach(potentialModulePath => {
             p = p.catch(
-              () => this._loadAsFile(potentialModulePath)
+              () => this._loadAsFile(potentialModulePath, fromModule, toModuleName)
             ).catch(
-              () => this._loadAsDir(potentialModulePath)
+              () => this._loadAsDir(potentialModulePath, fromModule, toModuleName)
             );
           });
 
@@ -276,25 +273,35 @@ class DependencyGraph {
     }
   }
 
-  _loadAsFile(potentialModulePath) {
+  _loadAsFile(potentialModulePath, fromModule, toModule) {
     return Promise.resolve().then(() => {
 
       let file;
       if (this._fastfs.fileExists(potentialModulePath)) {
         file = potentialModulePath;
+      } else if (this._platform != null &&
+                 this._fastfs.fileExists(potentialModulePath + '.' + this._platform + '.js')) {
+        file = potentialModulePath + '.' + this._platform + '.js';
+      } else if (this._preferNativePlatform &&
+                 this._fastfs.fileExists(potentialModulePath + '.native.js')) {
+        file = potentialModulePath + '.native.js';
       } else if (this._fastfs.fileExists(potentialModulePath + '.js')) {
         file = potentialModulePath + '.js';
       } else if (this._fastfs.fileExists(potentialModulePath + '.json')) {
         file = potentialModulePath + '.json';
       } else {
-        throw new Error(`File ${potentialModulePath} doesnt exist`);
+        throw new UnableToResolveError(
+          fromModule,
+          toModule,
+          `File ${potentialModulePath} doesnt exist`,
+        );
       }
 
       return this._moduleCache.getModule(file);
     });
   }
 
-  _loadAsDir(potentialDirPath) {
+  _loadAsDir(potentialDirPath, fromModule, toModuleName) {
     return Promise.resolve().then(() => {
       if (!this._fastfs.dirExists(potentialDirPath)) {
         throw new Error(`Invalid directory ${potentialDirPath}`);
@@ -304,13 +311,13 @@ class DependencyGraph {
       if (this._fastfs.fileExists(packageJsonPath)) {
         return this._moduleCache.getPackage(packageJsonPath)
           .getMain().then(
-            (main) => this._loadAsFile(main).catch(
-              () => this._loadAsDir(main)
+            (main) => this._loadAsFile(main, fromModule, toModuleName).catch(
+              () => this._loadAsDir(main, fromModule, toModuleName)
             )
           );
       }
 
-      return this._loadAsFile(path.join(potentialDirPath, 'index'));
+      return this._loadAsFile(path.join(potentialDirPath, 'index'), fromModule, toModuleName);
     });
   }
 
@@ -367,7 +374,7 @@ class DependencyGraph {
 
     parts = parts.slice(indexOfNodeModules + 1);
 
-    const dirs = this._opts.providesModuleNodeModules;
+    const dirs = this._providesModuleNodeModules;
 
     if(!dirs){
       return false;
@@ -389,7 +396,7 @@ class DependencyGraph {
 
     const absPath = path.join(root, filePath);
     if ((fstat && fstat.isDirectory()) ||
-        this._opts.ignoreFilePath(absPath) ||
+        this._ignoreFilePath(absPath) ||
         this._isNodeModulesDir(absPath)) {
       return;
     }
@@ -446,5 +453,19 @@ function normalizePath(modulePath) {
 }
 
 util.inherits(NotFoundError, Error);
+
+function UnableToResolveError(fromModule, toModule, message) {
+  Error.call(this);
+  Error.captureStackTrace(this, this.constructor);
+  this.message = util.format(
+    'Unable to resolve module %s from %s: %s',
+    toModule,
+    fromModule.path,
+    message,
+  );
+  this.type = this.name = 'UnableToResolveError';
+}
+
+util.inherits(UnableToResolveError, Error);
 
 module.exports = DependencyGraph;
