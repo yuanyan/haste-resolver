@@ -1,17 +1,17 @@
 {
   "name": "haste-resolver",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Haste Resolver",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git@github.com:yuanyan/haste-resolver.git"
   },
   "keywords": [
     "haste",
     "haste-resolver"
   ],
   "scripts": {
-    "prepublish": "babel ./src --out-dir ./lib"
+    "prepublish": "babel ./src --out-dir ./lib --stage=1"
   },
   "dependencies": {
     "absolute-path": "0.0.0",

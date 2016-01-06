@@ -30,7 +30,7 @@ class DependencyGraph {
     this._roots = roots;
     this._platform = platform;
     this._preferNativePlatform = preferNativePlatform;
-    this._providesModuleNodeModules = providesModuleNodeModules;
+    this._providesModuleNodeModules = providesModuleNodeModules || [];
     this._ignoreFilePath = ignoreFilePath || function(){};
 
     this._hasteMap = Object.create(null);
@@ -375,10 +375,6 @@ class DependencyGraph {
     parts = parts.slice(indexOfNodeModules + 1);
 
     const dirs = this._providesModuleNodeModules;
-
-    if(!dirs){
-      return false;
-    }
 
     for (let i = 0; i < dirs.length; i++) {
       if (parts.indexOf(dirs[i]) > -1) {
