@@ -2,8 +2,8 @@
 
 const Promise = require('promise');
 const debug = require('debug')('DependencyGraph');
-const fs = require('fs');
-const path = require('path');
+const fs = require('graceful-fs');
+const path = require('fast-path');
 
 const readDir = Promise.denodeify(fs.readdir);
 const stat = Promise.denodeify(fs.stat);
@@ -35,6 +35,8 @@ function nodeRecReadDir(roots, {ignore, exts}) {
           if (ignore(filePath)) {
             return;
           }
+
+          // console.log(filePath)
 
           if (stats[i].isDirectory()) {
             queue.push(filePath);

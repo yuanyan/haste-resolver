@@ -8,61 +8,178 @@
  */
 'use strict';
 
-var path = require('path');
-var DependencyGraph = require('./DependencyGraph');
-var Promise = require('promise');
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const Activity = require('./Activity');
+const Cache = require('./Cache');
+const DependencyGraph = require('./DependencyGraph');
+const Promise = require('promise');
+const Polyfill = require('./Polyfill');
 
-function HasteDependencyResolver({
-  roots,
-  blacklistRE,
-  providesModuleNodeModules,
-  platform,
-  preferNativePlatform,
-}) {
+class Resolver {
+  constructor({
+    roots,
+    blacklistRE,
+    providesModuleNodeModules = [],
+    polyfillModuleNames = [],
+    platforms,
+    preferNativePlatform = true,
+    assetExts,
+    fileWatcher,
+    resetCache,
+    shouldThrowOnUnresolvedErrors
+  }) {
 
-  this._depGraph = new DependencyGraph({
-    roots: roots,
-    ignoreFilePath: function(filepath) {
-      return filepath.indexOf('__tests__') !== -1 ||
-        (blacklistRE && blacklistRE.test(filepath));
-    },
-    providesModuleNodeModules: providesModuleNodeModules,
-    platform: platform,
-    preferNativePlatform, preferNativePlatform
-  });
-}
+    roots = roots.map(function(root){
+      return path.resolve(root);
+    });
 
-HasteDependencyResolver.prototype.getDependencies = function(main, options) {
+    roots.forEach(verifyRootExists);
 
-  var depGraph = this._depGraph;
-  var self = this;
-  return depGraph.load().then(
-    () => depGraph.getOrderedDependencies(main).then(
-      dependencies => {
-        const mainModuleId = dependencies[0].id;
-        return {
-          mainModuleId: mainModuleId,
-          dependencies: dependencies
-        };
-      }
-    )
-  );
-};
+    this._depGraph = new DependencyGraph({
+      activity: Activity,
+      roots,
+      assetExts,
+      providesModuleNodeModules,
+      platforms: platforms || ['ios', 'android', 'web', 'weex'],
+      preferNativePlatform,
+      fileWatcher,
+      shouldThrowOnUnresolvedErrors,
+      ignoreFilePath: function(filepath) {
+        return filepath.indexOf('__tests__') !== -1 ||
+          (blacklistRE && blacklistRE.test(filepath));
+      },
+      cache: new Cache({
+        resetCache: resetCache,
+        cacheKey: [
+          'haste-resolver-cache',
+          roots.join(',').split(path.sep).join('-')
+        ].join('$'),
+      }),
+    });
 
-HasteDependencyResolver.prototype.getHasteMap = function(callback) {
+    this._polyfillModuleNames = polyfillModuleNames || [];
 
-  var depGraph = this._depGraph;
-
-  if(depGraph.loaded){
-    return callback(depGraph._hasteMap)
+    this._depGraph.load().catch(err => {
+       console.error(err.message + '\n' + err.stack);
+       process.exit(1);
+     });
   }
 
-  var self = this;
-  return depGraph.load().then(() => {
-    depGraph.loaded = true
-    callback(depGraph._hasteMap)
-  })
+  getDependencies(main, options) {
 
-};
+    return this._depGraph.getDependencies(
+      main,
+      options.platform,
+      options.recursive,
+    ).then(resolutionResponse => {
+      this._getPolyfillDependencies().reverse().forEach(
+        polyfill => resolutionResponse.prependDependency(polyfill)
+      );
 
-module.exports = HasteDependencyResolver;
+      return resolutionResponse.finalize();
+    });
+  }
+
+  _getPolyfillDependencies() {
+    const polyfillModuleNames = this._polyfillModuleNames;
+
+    return polyfillModuleNames.map(
+      (polyfillModuleName, idx) => new Polyfill({
+        path: polyfillModuleName,
+        id: polyfillModuleName,
+        dependencies: polyfillModuleNames.slice(0, idx),
+        isPolyfill: true,
+      })
+    );
+  }
+
+  getHasteMap() {
+    var depGraph = this._depGraph;
+    return depGraph.load().then(()=>{
+      return depGraph._hasteMap;
+    })
+  }
+
+  resolveRequires(resolutionResponse, module, code) {
+    return Promise.resolve().then(() => {
+      if (module.isPolyfill()) {
+        return Promise.resolve({code});
+      }
+
+      const resolvedDeps = Object.create(null);
+      const resolvedDepsArr = [];
+
+      return Promise.all(
+        resolutionResponse.getResolvedDependencyPairs(module).map(
+          ([depName, depModule]) => {
+            if (depModule) {
+              return depModule.getName().then(name => {
+                resolvedDeps[depName] = name;
+                resolvedDepsArr.push(name);
+              });
+            }
+          }
+        )
+      ).then(() => {
+        const relativizeCode = (codeMatch, pre, quot, depName, post) => {
+          const depId = resolvedDeps[depName];
+          if (depId) {
+            return pre + quot + depId + post;
+          } else {
+            return codeMatch;
+          }
+        };
+
+        code = code
+          .replace(replacePatterns.IMPORT_RE, relativizeCode)
+          .replace(replacePatterns.EXPORT_RE, relativizeCode)
+          .replace(replacePatterns.REQUIRE_RE, relativizeCode);
+
+        return module.getName().then(name => {
+          return {name, code};
+        });
+      });
+    });
+  }
+
+  wrapModule(resolutionResponse, module, code) {
+    if (module.isPolyfill()) {
+      return Promise.resolve({
+        code: definePolyfillCode(code),
+      });
+    }
+
+    return this.resolveRequires(resolutionResponse, module, code).then(
+      ({name, code}) => {
+        return {name, code: defineModuleCode(name, code)};
+      });
+  }
+
+}
+
+function defineModuleCode(moduleName, code) {
+  return [
+    `__d(`,
+    `'${moduleName}',`,
+    'function(global, require, module, exports) {',
+    `  ${code}`,
+    '\n});',
+  ].join('');
+}
+
+function definePolyfillCode(code) {
+  return [
+    '(function(global) {',
+    code,
+    `\n})(typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : this);`,
+  ].join('');
+}
+
+function verifyRootExists(root) {
+  // Verify that the root exists.
+  assert(fs.statSync(root).isDirectory(), 'Root has to be a valid directory');
+}
+
+module.exports = Resolver;

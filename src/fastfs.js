@@ -1,91 +1,115 @@
+/**
+ * Copyright (c) 2015-present, Facebook, Inc.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree. An additional grant
+ * of patent rights can be found in the PATENTS file in the same directory.
+ */
 'use strict';
 
 const Promise = require('promise');
 const {EventEmitter} = require('events');
 
-const _ = require('underscore');
-const fs = require('fs');
-const path = require('path');
+const fs = require('graceful-fs');
+const path = require('fast-path');
+
+// workaround for https://github.com/isaacs/node-graceful-fs/issues/56
+// fs.close is patched, whereas graceful-fs.close is not.
+const fsClose = require('fs').close;
 
 const readFile = Promise.denodeify(fs.readFile);
 const stat = Promise.denodeify(fs.stat);
 
-const hasOwn = Object.prototype.hasOwnProperty;
+const NOT_FOUND_IN_ROOTS = 'NotFoundInRootsError';
 
 class Fastfs extends EventEmitter {
-  constructor(roots, {ignore, crawling}) {
+  constructor(name, roots, fileWatcher, {ignore, crawling, activity}) {
     super();
+    this._name = name;
+    this._fileWatcher = fileWatcher;
     this._ignore = ignore;
-    this._roots = roots.map(root => new File(root, { isDir: true }));
+    this._roots = roots.map(root => {
+      // If the path ends in a separator ("/"), remove it to make string
+      // operations on paths safer.
+      if (root.endsWith(path.sep)) {
+        root = root.substr(0, root.length - 1);
+      }
+      return new File(root, true);
+    });
     this._fastPaths = Object.create(null);
     this._crawling = crawling;
+    this._activity = activity;
   }
 
   build() {
-    const rootsPattern = new RegExp(
-      '^(' + this._roots.map(root => escapeRegExp(root.path)).join('|') + ')'
-    );
 
     return this._crawling.then(files => {
+      let fastfsActivity;
+      const activity = this._activity;
+      if (activity) {
+        fastfsActivity = activity.startEvent('Building in-memory fs for ' + this._name);
+      }
       files.forEach(filePath => {
-        if (filePath.match(rootsPattern)) {
-          const newFile = new File(filePath, { isDir: false });
-          const parent = this._fastPaths[path.dirname(filePath)];
+        const root = this._getRoot(filePath);
+        if (root) {
+          const newFile = new File(filePath, false);
+          const dirname = filePath.substr(0, filePath.lastIndexOf(path.sep));
+          const parent = this._fastPaths[dirname];
+          this._fastPaths[filePath] = newFile;
           if (parent) {
-            parent.addChild(newFile);
+            parent.addChild(newFile, this._fastPaths);
           } else {
-            this._add(newFile);
-            for (let file = newFile; file; file = file.parent) {
-              if (!this._fastPaths[file.path]) {
-                this._fastPaths[file.path] = file;
-              }
-            }
+            root.addChild(newFile, this._fastPaths);
           }
         }
       });
-      // this._fileWatcher.on('all', this._processFileChange.bind(this));
+      if (activity) {
+        activity.endEvent(fastfsActivity);
+      }
+      // NOTE
+      if (this._fileWatcher) {
+        this._fileWatcher.on('all', this._processFileChange.bind(this));
+      }
+
     });
   }
 
   stat(filePath) {
-    return Promise.resolve().then(() => {
-      const file = this._getFile(filePath);
-      return file.stat();
-    });
+    return Promise.resolve().then(() => this._getFile(filePath).stat());
   }
 
   getAllFiles() {
-    return _.chain(this._roots)
-      .map(root => root.getFiles())
-      .flatten()
-      .value();
+    return Object.keys(this._fastPaths)
+      .filter(filePath => !this._fastPaths[filePath].isDir);
   }
 
-  findFilesByExt(ext, { ignore }) {
+  findFilesByExts(exts, { ignore } = {}) {
     return this.getAllFiles()
-      .filter(
-        file => file.ext() === ext && (!ignore || !ignore(file.path))
-      )
-      .map(file => file.path);
+      .filter(filePath => (
+        exts.indexOf(path.extname(filePath).substr(1)) !== -1 &&
+        (!ignore || !ignore(filePath))
+      ));
   }
 
-  findFilesByExts(exts) {
-    return this.getAllFiles()
-      .filter(file => exts.indexOf(file.ext()) !== -1)
-      .map(file => file.path);
-  }
-
-  findFilesByName(name, { ignore }) {
-    return this.getAllFiles()
-      .filter(
-        file => path.basename(file.path) === name &&
-          (!ignore || !ignore(file.path))
-      )
-      .map(file => file.path);
+  matchFilesByPattern(pattern) {
+    return this.getAllFiles().filter(file => file.match(pattern));
   }
 
   readFile(filePath) {
-    return this._getFile(filePath).read();
+    const file = this._getFile(filePath);
+    if (!file) {
+      throw new Error(`Unable to find file with path: ${filePath}`);
+    }
+    return file.read();
+  }
+
+  readWhile(filePath, predicate) {
+    const file = this._getFile(filePath);
+    if (!file) {
+      throw new Error(`Unable to find file with path: ${filePath}`);
+    }
+    return file.readWhile(predicate);
   }
 
   closest(filePath, name) {
@@ -100,17 +124,35 @@ class Fastfs extends EventEmitter {
   }
 
   fileExists(filePath) {
-    const file = this._getFile(filePath);
+    let file;
+    try {
+      file = this._getFile(filePath);
+    } catch (e) {
+      if (e.type === NOT_FOUND_IN_ROOTS) {
+        return false;
+      }
+      throw e;
+    }
+
     return file && !file.isDir;
   }
 
   dirExists(filePath) {
-    const file = this._getFile(filePath);
+    let file;
+    try {
+      file = this._getFile(filePath);
+    } catch (e) {
+      if (e.type === NOT_FOUND_IN_ROOTS) {
+        return false;
+      }
+      throw e;
+    }
+
     return file && file.isDir;
   }
 
   matches(dir, pattern) {
-    let dirFile = this._getFile(dir);
+    const dirFile = this._getFile(dir);
     if (!dirFile.isDir) {
       throw new Error(`Expected file ${dirFile.path} to be a directory`);
     }
@@ -122,7 +164,7 @@ class Fastfs extends EventEmitter {
 
   _getRoot(filePath) {
     for (let i = 0; i < this._roots.length; i++) {
-      let possibleRoot = this._roots[i];
+      const possibleRoot = this._roots[i];
       if (isDescendant(possibleRoot.path, filePath)) {
         return possibleRoot;
       }
@@ -133,33 +175,34 @@ class Fastfs extends EventEmitter {
   _getAndAssertRoot(filePath) {
     const root = this._getRoot(filePath);
     if (!root) {
-      throw new Error(`File ${filePath} not found in any of the roots`);
+      const error = new Error(`File ${filePath} not found in any of the roots`);
+      error.type = NOT_FOUND_IN_ROOTS;
+      throw error;
     }
     return root;
   }
 
   _getFile(filePath) {
     filePath = path.normalize(filePath);
-    if (!hasOwn.call(this._fastPaths, filePath)) {
-      this._fastPaths[filePath] = this._getAndAssertRoot(filePath).getFileFromPath(filePath);
+    if (!this._fastPaths[filePath]) {
+      const file = this._getAndAssertRoot(filePath).getFileFromPath(filePath);
+      if (file) {
+        this._fastPaths[filePath] = file;
+      }
     }
 
     return this._fastPaths[filePath];
   }
 
-  _add(file) {
-    this._getAndAssertRoot(file.path).addChild(file);
-  }
-
-
-  _processFileChange(type, filePath, root, fstat) {
-    const absPath = path.join(root, filePath);
+  _processFileChange(type, filePath, rootPath, fstat) {
+    const absPath = path.join(rootPath, filePath);
     if (this._ignore(absPath) || (fstat && fstat.isDirectory())) {
       return;
     }
 
     // Make sure this event belongs to one of our roots.
-    if (!this._getRoot(absPath)) {
+    const root = this._getRoot(absPath);
+    if (!root) {
       return;
     }
 
@@ -173,20 +216,19 @@ class Fastfs extends EventEmitter {
     delete this._fastPaths[path.normalize(absPath)];
 
     if (type !== 'delete') {
-      this._add(new File(absPath, { isDir: false }));
+      const file = new File(absPath, false);
+      root.addChild(file, this._fastPaths);
     }
 
-    this.emit('change', type, filePath, root, fstat);
+    this.emit('change', type, filePath, rootPath, fstat);
   }
 }
 
 class File {
-  constructor(filePath, { isDir }) {
+  constructor(filePath, isDir) {
     this.path = filePath;
-    this.isDir = Boolean(isDir);
-    if (this.isDir) {
-      this.children = Object.create(null);
-    }
+    this.isDir = isDir;
+    this.children = this.isDir ? Object.create(null) : null;
   }
 
   read() {
@@ -194,6 +236,15 @@ class File {
       this._read = readFile(this.path, 'utf8');
     }
     return this._read;
+  }
+
+  readWhile(predicate) {
+    return readWhile(this.path, predicate).then(({result, completed}) => {
+      if (completed && !this._read) {
+        this._read = Promise.resolve(result);
+      }
+      return result;
+    });
   }
 
   stat() {
@@ -204,34 +255,29 @@ class File {
     return this._stat;
   }
 
-  addChild(file) {
-    const parts = path.relative(this.path, file.path).split(path.sep);
-
-    if (parts.length === 0) {
-      return;
-    }
-
+  addChild(file, fileMap) {
+    const parts = file.path.substr(this.path.length + 1).split(path.sep);
     if (parts.length === 1) {
       this.children[parts[0]] = file;
       file.parent = this;
     } else if (this.children[parts[0]]) {
-      this.children[parts[0]].addChild(file);
+      this.children[parts[0]].addChild(file, fileMap);
     } else {
-      const dir = new File(path.join(this.path, parts[0]), { isDir: true });
+      const dir = new File(this.path + path.sep + parts[0], true);
       dir.parent = this;
       this.children[parts[0]] = dir;
-      dir.addChild(file);
+      fileMap[dir.path] = dir;
+      dir.addChild(file, fileMap);
     }
   }
 
   getFileFromPath(filePath) {
-    const parts = path.relative(this.path, filePath)
-            .split(path.sep);
+    const parts = path.relative(this.path, filePath).split(path.sep);
 
     /*eslint consistent-this:0*/
     let file = this;
     for (let i = 0; i < parts.length; i++) {
-      let fileName = parts[i];
+      const fileName = parts[i];
       if (!fileName) {
         continue;
       }
@@ -247,18 +293,8 @@ class File {
     return file;
   }
 
-  getFiles() {
-    return _.flatten(_.values(this.children).map(file => {
-      if (file.isDir) {
-        return file.getFiles();
-      } else {
-        return file;
-      }
-    }));
-  }
-
   ext() {
-    return path.extname(this.path).replace(/^\./, '');
+    return path.extname(this.path).substr(1);
   }
 
   remove() {
@@ -270,12 +306,60 @@ class File {
   }
 }
 
-function isDescendant(root, child) {
-  return path.relative(root, child).indexOf('..') !== 0;
+function readWhile(filePath, predicate) {
+  return new Promise((resolve, reject) => {
+    fs.open(filePath, 'r', (openError, fd) => {
+      if (openError) {
+        reject(openError);
+        return;
+      }
+
+      read(
+        fd,
+        /*global Buffer: true*/
+        new Buffer(512),
+        makeReadCallback(fd, predicate, (readError, result, completed) => {
+          if (readError) {
+            reject(readError);
+          } else {
+            resolve({result, completed});
+          }
+        })
+      );
+    });
+  });
 }
 
-function escapeRegExp(str) {
-  return str.replace(/[\-\[\]\/\{\}\(\)\*\+\?\.\\\^\$\|]/g, '\\$&');
+function read(fd, buffer, callback) {
+  fs.read(fd, buffer, 0, buffer.length, -1, callback);
+}
+
+function close(fd, error, result, complete, callback) {
+  fsClose(fd, closeError => callback(error || closeError, result, complete));
+}
+
+function makeReadCallback(fd, predicate, callback) {
+  let result = '';
+  let index = 0;
+  return function readCallback(error, bytesRead, buffer) {
+    if (error) {
+      close(fd, error, undefined, false, callback);
+      return;
+    }
+
+    const completed = bytesRead === 0;
+    const chunk = completed ? '' : buffer.toString('utf8', 0, bytesRead);
+    result += chunk;
+    if (completed || !predicate(chunk, index++, result)) {
+      close(fd, null, result, completed, callback);
+    } else {
+      read(fd, buffer, readCallback);
+    }
+  };
+}
+
+function isDescendant(root, child) {
+  return child.startsWith(root);
 }
 
 module.exports = Fastfs;

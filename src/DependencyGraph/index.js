@@ -1,432 +1,277 @@
 /**
- * Copyright (c) 2015-present, Yuanyan Cao. All rights reserved.
- * Copyright (c) 2015-present, Facebook, Inc.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
- */
+* Copyright (c) 2015-present, Facebook, Inc.
+* All rights reserved.
+*
+* This source code is licensed under the BSD-style license found in the
+* LICENSE file in the root directory of this source tree. An additional grant
+* of patent rights can be found in the PATENTS file in the same directory.
+*/
 'use strict';
 
 const Fastfs = require('../fastfs');
 const ModuleCache = require('../ModuleCache');
 const Promise = require('promise');
-const _ = require('underscore');
 const crawl = require('../crawlers');
-const debug = require('debug')('DependencyGraph');
+const getPlatformExtension = require('../utils/getPlatformExtension');
 const isAbsolutePath = require('absolute-path');
-const path = require('path');
+const path = require('fast-path');
 const util = require('util');
+const DependencyGraphHelpers = require('./DependencyGraphHelpers');
+const ResolutionRequest = require('./ResolutionRequest');
+const ResolutionResponse = require('./ResolutionResponse');
+const HasteMap = require('./HasteMap');
+const DeprecatedAssetMap = require('./DeprecatedAssetMap');
+
+const ERROR_BUILDING_DEP_GRAPH = 'DependencyGraphError';
+
+const defaultActivity = {
+ startEvent: () => {},
+ endEvent: () => {},
+};
 
 class DependencyGraph {
-  constructor({
-    roots,
-    platform,
-    preferNativePlatform,
-    ignoreFilePath,
-    providesModuleNodeModules,
-  }) {
-    this._roots = roots;
-    this._platform = platform;
-    this._preferNativePlatform = preferNativePlatform;
-    this._providesModuleNodeModules = providesModuleNodeModules || [];
-    this._ignoreFilePath = ignoreFilePath || function(){};
-
-    this._hasteMap = Object.create(null);
-    this._immediateResolutionCache = Object.create(null);
-    this.load();
-  }
-
-  load() {
-    if (this._loading) {
-      return this._loading;
-    }
-
-    var startTime = new Date;
-    const allRoots = this._roots;
-    this._crawling = crawl(allRoots, {
-      ignore: this._ignoreFilePath,
-      exts: ['js', 'json']
-    });
-
-    this._crawling.then((files) => console.log('Crawl:', (new Date - startTime) + 'ms'));
-
-    this._fastfs = new Fastfs(this._roots, {
-      ignore: this._ignoreFilePath,
-      crawling: this._crawling,
-    });
-
-    this._fastfs.on('change', this._processFileChange.bind(this));
-
-    this._moduleCache = new ModuleCache(this._fastfs);
-
-    this._loading = Promise.all([
-      this._fastfs.build().then(() => this._buildHasteMap())
-    ]);
-
-    return this._loading;
-  }
-
-  resolveDependency(fromModule, toModuleName) {
-    if (fromModule._ref) {
-      fromModule = fromModule._ref;
-    }
-
-    const resHash = resolutionHash(fromModule.path, toModuleName);
-
-    if (this._immediateResolutionCache[resHash]) {
-      return Promise.resolve(this._immediateResolutionCache[resHash]);
-    }
-
-    const cacheResult = (result) => {
-      this._immediateResolutionCache[resHash] = result;
-      return result;
-    };
-
-    const forgive = () => {
-      console.warn(
-        'Unable to resolve module %s from %s',
-        toModuleName,
-        fromModule.path
-      );
-      return null;
-    };
-
-    if (!this._isNodeModulesDir(fromModule.path)
-        && toModuleName[0] !== '.' &&
-        toModuleName[0] !== '/') {
-      return this._resolveHasteDependency(fromModule, toModuleName).catch(
-        () => this._resolveNodeDependency(fromModule, toModuleName)
-      ).then(
-        cacheResult,
-        forgive
-      );
-    }
-
-    return this._resolveNodeDependency(fromModule, toModuleName)
-      .then(
-        cacheResult,
-        forgive
-      );
-  }
-
-  getOrderedDependencies(entryPath) {
-    return this.load().then(() => {
-      const absPath = this._getAbsolutePath(entryPath);
-
-      if (absPath == null) {
-        throw new NotFoundError(
-          'Could not find source file at %s',
-          entryPath
-        );
-      }
-
-      const absolutePath = path.resolve(absPath);
-
-      if (absolutePath == null) {
-        throw new NotFoundError(
-          'Cannot find entry file %s in any of the roots: %j',
-          entryPath,
-          this._roots
-        );
-      }
-
-      const entry = this._moduleCache.getModule(absolutePath);
-      const deps = [];
-      const visited = Object.create(null);
-      visited[entry.hash()] = true;
-
-      const collect = (mod) => {
-        deps.push(mod);
-        return mod.getDependencies().then(
-          depNames => Promise.all(
-            depNames.map(name => this.resolveDependency(mod, name))
-          ).then((dependencies) => [depNames, dependencies])
-        ).then(([depNames, dependencies]) => {
-          let p = Promise.resolve();
-          dependencies.forEach((modDep, i) => {
-            if (modDep == null) {
-              debug(
-                'WARNING: Cannot find required module `%s` from module `%s`',
-                depNames[i],
-                mod.path
-              );
-              return;
-            }
-
-            p = p.then(() => {
-              if (!visited[modDep.hash()]) {
-                visited[modDep.hash()] = true;
-                return collect(modDep);
-              }
-              return null;
-            });
-          });
-
-          return p;
-        });
-      };
-
-      return collect(entry)
-        .then(() => Promise.all(deps.map(dep => dep.getPlainObject())));
-    });
-  }
-
-  _getAbsolutePath(filePath) {
-    if (isAbsolutePath(filePath)) {
-      return filePath;
-    }
-
-    for (let i = 0; i < this._roots.length; i++) {
-      const root = this._roots[i];
-      const absPath = path.join(root, filePath);
-      if (this._fastfs.fileExists(absPath)) {
-        return absPath;
-      }
-    }
-
-    return null;
-  }
-
-  _resolveHasteDependency(fromModule, toModuleName) {
-    toModuleName = normalizePath(toModuleName);
-
-    let p = fromModule.getPackage();
-    if (p) {
-      p = p.redirectRequire(toModuleName);
-    } else {
-      p = Promise.resolve(toModuleName);
-    }
-
-    return p.then((realModuleName) => {
-      let dep = this._hasteMap[realModuleName];
-
-      if (dep && dep.type === 'Module') {
-        return dep;
-      }
-
-      let packageName = realModuleName;
-
-      while (packageName && packageName !== '.') {
-        dep = this._hasteMap[packageName];
-        if (dep && dep.type === 'Package') {
-          break;
-        }
-        packageName = path.dirname(packageName);
-      }
-
-      if (dep && dep.type === 'Package') {
-        const potentialModulePath = path.join(
-          dep.root,
-          path.relative(packageName, realModuleName)
-        );
-        return this._loadAsFile(potentialModulePath, fromModule, toModuleName)
-          .catch(() => this._loadAsDir(potentialModulePath, fromModule, toModuleName));
-      }
-
-      throw new Error('Unable to resolve dependency');
-    });
-  }
-
-  _redirectRequire(fromModule, modulePath) {
-    return Promise.resolve(fromModule.getPackage()).then(p => {
-      if (p) {
-        return p.redirectRequire(modulePath);
-      }
-      return modulePath;
-    });
-  }
-
-  _resolveNodeDependency(fromModule, toModuleName) {
-    if (toModuleName[0] === '.' || toModuleName[1] === '/') {
-      const potentialModulePath = isAbsolutePath(toModuleName) ?
-              toModuleName :
-              path.join(path.dirname(fromModule.path), toModuleName);
-      return this._redirectRequire(fromModule, potentialModulePath).then(
-        realModuleName => this._loadAsFile(realModuleName, fromModule, toModuleName)
-          .catch(() => this._loadAsDir(realModuleName, fromModule, toModuleName))
-      );
-    } else {
-      return this._redirectRequire(fromModule, toModuleName).then(
-        realModuleName => {
-          const searchQueue = [];
-          for (let currDir = path.dirname(fromModule.path);
-               currDir !== '/';
-               currDir = path.dirname(currDir)) {
-            searchQueue.push(
-              path.join(currDir, 'node_modules', realModuleName)
-            );
-          }
-
-          let p = Promise.reject(new Error('Node module not found'));
-          searchQueue.forEach(potentialModulePath => {
-            p = p.catch(
-              () => this._loadAsFile(potentialModulePath, fromModule, toModuleName)
-            ).catch(
-              () => this._loadAsDir(potentialModulePath, fromModule, toModuleName)
-            );
-          });
-
-          return p;
-        });
-    }
-  }
-
-  _loadAsFile(potentialModulePath, fromModule, toModule) {
-    return Promise.resolve().then(() => {
-
-      let file;
-      if (this._fastfs.fileExists(potentialModulePath)) {
-        file = potentialModulePath;
-      } else if (this._platform != null &&
-                 this._fastfs.fileExists(potentialModulePath + '.' + this._platform + '.js')) {
-        file = potentialModulePath + '.' + this._platform + '.js';
-      } else if (this._preferNativePlatform &&
-                 this._fastfs.fileExists(potentialModulePath + '.native.js')) {
-        file = potentialModulePath + '.native.js';
-      } else if (this._fastfs.fileExists(potentialModulePath + '.js')) {
-        file = potentialModulePath + '.js';
-      } else if (this._fastfs.fileExists(potentialModulePath + '.json')) {
-        file = potentialModulePath + '.json';
-      } else {
-        throw new UnableToResolveError(
-          fromModule,
-          toModule,
-          `File ${potentialModulePath} doesnt exist`,
-        );
-      }
-
-      return this._moduleCache.getModule(file);
-    });
-  }
-
-  _loadAsDir(potentialDirPath, fromModule, toModuleName) {
-    return Promise.resolve().then(() => {
-      if (!this._fastfs.dirExists(potentialDirPath)) {
-        throw new Error(`Invalid directory ${potentialDirPath}`);
-      }
-
-      const packageJsonPath = path.join(potentialDirPath, 'package.json');
-      if (this._fastfs.fileExists(packageJsonPath)) {
-        return this._moduleCache.getPackage(packageJsonPath)
-          .getMain().then(
-            (main) => this._loadAsFile(main, fromModule, toModuleName).catch(
-              () => this._loadAsDir(main, fromModule, toModuleName)
-            )
-          );
-      }
-
-      return this._loadAsFile(path.join(potentialDirPath, 'index'), fromModule, toModuleName);
-    });
-  }
-
-  _buildHasteMap() {
-    let promises = this._fastfs.findFilesByExt('js', {
-      ignore: (file) => this._isNodeModulesDir(file)
-    }).map(file => this._processHasteModule(file));
-
-    return Promise.all(promises);
-  }
-
-  _processHasteModule(file) {
-    const module = this._moduleCache.getModule(file);
-    return module.isHaste().then(
-      isHaste => isHaste && module.getName()
-        .then(name => this._updateHasteMap(name, module))
-    );
-  }
-
-  _processHastePackage(file) {
-    file = path.resolve(file);
-    const p = this._moduleCache.getPackage(file, this._fastfs);
-    return p.isHaste()
-      .then(isHaste => isHaste && p.getName()
-            .then(name => this._updateHasteMap(name, p)))
-      .catch(e => {
-        if (e instanceof SyntaxError) {
-          // Malformed package.json.
-          return;
-        }
-        throw e;
-      });
-  }
-
-  _updateHasteMap(name, mod) {
-    if (this._hasteMap[name]) {
-      debug('WARNING: conflicting haste modules: ' + name);
-      if (mod.type === 'Package' &&
-          this._hasteMap[name].type === 'Module') {
-        // Modules takes precendence over packages.
-        return;
-      }
-    }
-    this._hasteMap[name] = mod;
-  }
-
-  _isNodeModulesDir(file) {
-    let parts = path.normalize(file).split(path.sep);
-    const indexOfNodeModules = parts.lastIndexOf('node_modules');
-
-    if (indexOfNodeModules === -1) {
-      return false;
-    }
-
-    parts = parts.slice(indexOfNodeModules + 1);
-
-    const dirs = this._providesModuleNodeModules;
-
-    for (let i = 0; i < dirs.length; i++) {
-      if (parts.indexOf(dirs[i]) > -1) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
-  _processFileChange(type, filePath, root, fstat) {
-    // It's really hard to invalidate the right module resolution cache
-    // so we just blow it up with every file change.
-    this._immediateResolutionCache = Object.create(null);
-
-    const absPath = path.join(root, filePath);
-    if ((fstat && fstat.isDirectory()) ||
-        this._ignoreFilePath(absPath) ||
-        this._isNodeModulesDir(absPath)) {
-      return;
-    }
-
-    if (type === 'delete' || type === 'change') {
-      _.each(this._hasteMap, (mod, name) => {
-        if (mod.path === absPath) {
-          delete this._hasteMap[name];
-        }
-      });
-
-      if (type === 'delete') {
-        return;
-      }
-    }
-
-    if (extname(absPath) === 'js' || extname(absPath) === 'json') {
-      this._loading = this._loading.then(() => {
-        if (path.basename(filePath) === 'package.json') {
-          return this._processHastePackage(absPath);
-        } else {
-          return this._processHasteModule(absPath);
-        }
-      });
-    }
-  }
-}
-
-function extname(name) {
-  return path.extname(name).replace(/^\./, '');
-}
-
-function resolutionHash(modulePath, depName) {
-  return `${path.resolve(modulePath)}:${depName}`;
+ constructor({
+   activity,
+   roots,
+   ignoreFilePath,
+   fileWatcher,
+   assetRoots_DEPRECATED,
+   assetExts,
+   providesModuleNodeModules,
+   platforms,
+   preferNativePlatform,
+   cache,
+   extensions,
+   mocksPattern,
+   extractRequires,
+   transformCode,
+   shouldThrowOnUnresolvedErrors = () => true,
+   enableAssetMap,
+ }) {
+   this._opts = {
+     activity: activity || defaultActivity,
+     roots,
+     ignoreFilePath: ignoreFilePath || (() => {}),
+     fileWatcher,
+     assetRoots_DEPRECATED: assetRoots_DEPRECATED || [],
+     assetExts: assetExts || [],
+     providesModuleNodeModules,
+     platforms: platforms || [],
+     preferNativePlatform: preferNativePlatform || false,
+     extensions: extensions || ['js', 'json'],
+     mocksPattern,
+     extractRequires,
+     transformCode,
+     shouldThrowOnUnresolvedErrors,
+     enableAssetMap: enableAssetMap || true,
+   };
+   this._cache = cache;
+   this._helpers = new DependencyGraphHelpers(this._opts);
+   this.load();
+ }
+
+ load() {
+   if (this._loading) {
+     return this._loading;
+   }
+
+   const {activity} = this._opts;
+   const depGraphActivity = activity.startEvent('Building Dependency Graph');
+   const crawlActivity = activity.startEvent('Crawling File System');
+   const allRoots = this._opts.roots.concat(this._opts.assetRoots_DEPRECATED);
+   this._crawling = crawl(allRoots, {
+     ignore: this._opts.ignoreFilePath,
+     exts: this._opts.extensions.concat(this._opts.assetExts),
+     fileWatcher: this._opts.fileWatcher,
+   });
+   this._crawling.then((files) => activity.endEvent(crawlActivity));
+
+   this._fastfs = new Fastfs(
+     'JavaScript',
+     this._opts.roots,
+     this._opts.fileWatcher,
+     {
+       ignore: this._opts.ignoreFilePath,
+       crawling: this._crawling,
+       activity: activity,
+     }
+   );
+
+   this._fastfs.on('change', this._processFileChange.bind(this));
+
+   this._moduleCache = new ModuleCache({
+     fastfs: this._fastfs,
+     cache: this._cache,
+     extractRequires: this._opts.extractRequires,
+     transformCode: this._opts.transformCode,
+     depGraphHelpers: this._helpers,
+   });
+
+   this._hasteMap = new HasteMap({
+     fastfs: this._fastfs,
+     extensions: this._opts.extensions,
+     moduleCache: this._moduleCache,
+     preferNativePlatform: this._opts.preferNativePlatform,
+     helpers: this._helpers,
+   });
+
+   this._deprecatedAssetMap = new DeprecatedAssetMap({
+     fsCrawl: this._crawling,
+     roots: this._opts.assetRoots_DEPRECATED,
+     helpers: this._helpers,
+     fileWatcher: this._opts.fileWatcher,
+     ignoreFilePath: this._opts.ignoreFilePath,
+     assetExts: this._opts.assetExts,
+     activity: this._opts.activity,
+     enabled: this._opts.enableAssetMap,
+   });
+
+   this._loading = Promise.all([
+     this._fastfs.build()
+       .then(() => {
+         const hasteActivity = activity.startEvent('Building Haste Map');
+         return this._hasteMap.build().then(map => {
+           activity.endEvent(hasteActivity);
+           return map;
+         });
+       }),
+     this._deprecatedAssetMap.build(),
+   ]).then(
+     response => {
+       activity.endEvent(depGraphActivity);
+       return response[0]; // Return the haste map
+     },
+     err => {
+       const error = new Error(
+         `Failed to build DependencyGraph: ${err.message}`
+       );
+       error.type = ERROR_BUILDING_DEP_GRAPH;
+       error.stack = err.stack;
+       throw error;
+     }
+   );
+
+   return this._loading;
+ }
+
+ /**
+  * Returns a promise with the direct dependencies the module associated to
+  * the given entryPath has.
+  */
+ getShallowDependencies(entryPath) {
+   return this._moduleCache.getModule(entryPath).getDependencies();
+ }
+
+ getFS() {
+   return this._fastfs;
+ }
+
+ /**
+  * Returns the module object for the given path.
+  */
+ getModuleForPath(entryFile) {
+   return this._moduleCache.getModule(entryFile);
+ }
+
+ getAllModules() {
+   return this.load().then(() => this._moduleCache.getAllModules());
+ }
+
+ getDependencies(entryPath, platform, recursive = true) {
+   return this.load().then(() => {
+     platform = this._getRequestPlatform(entryPath, platform);
+     const absPath = this._getAbsolutePath(entryPath);
+     const req = new ResolutionRequest({
+       platform,
+       preferNativePlatform: this._opts.preferNativePlatform,
+       entryPath: absPath,
+       deprecatedAssetMap: this._deprecatedAssetMap,
+       hasteMap: this._hasteMap,
+       helpers: this._helpers,
+       moduleCache: this._moduleCache,
+       fastfs: this._fastfs,
+       shouldThrowOnUnresolvedErrors: this._opts.shouldThrowOnUnresolvedErrors,
+     });
+
+     const response = new ResolutionResponse();
+
+     return req.getOrderedDependencies(
+       response,
+       this._opts.mocksPattern,
+       recursive,
+     ).then(() => response);
+   });
+ }
+
+ matchFilesByPattern(pattern) {
+   return this.load().then(() => this._fastfs.matchFilesByPattern(pattern));
+ }
+
+ _getRequestPlatform(entryPath, platform) {
+   if (platform == null) {
+     platform = getPlatformExtension(entryPath);
+     if (platform == null || this._opts.platforms.indexOf(platform) === -1) {
+       platform = null;
+     }
+   } else if (this._opts.platforms.indexOf(platform) === -1) {
+     throw new Error('Unrecognized platform: ' + platform);
+   }
+   return platform;
+ }
+
+ _getAbsolutePath(filePath) {
+   if (isAbsolutePath(filePath)) {
+     return path.resolve(filePath);
+   }
+
+   for (let i = 0; i < this._opts.roots.length; i++) {
+     const root = this._opts.roots[i];
+     const potentialAbsPath = path.join(root, filePath);
+     if (this._fastfs.fileExists(potentialAbsPath)) {
+       return path.resolve(potentialAbsPath);
+     }
+   }
+
+   throw new NotFoundError(
+     'Cannot find entry file %s in any of the roots: %j',
+     filePath,
+     this._opts.roots
+   );
+ }
+
+ _processFileChange(type, filePath, root, fstat) {
+   const absPath = path.join(root, filePath);
+   if (fstat && fstat.isDirectory() ||
+       this._opts.ignoreFilePath(absPath) ||
+       this._helpers.isNodeModulesDir(absPath)) {
+     return;
+   }
+
+   // Ok, this is some tricky promise code. Our requirements are:
+   // * we need to report back failures
+   // * failures shouldn't block recovery
+   // * Errors can leave `hasteMap` in an incorrect state, and we need to rebuild
+   // After we process a file change we record any errors which will also be
+   // reported via the next request. On the next file change, we'll see that
+   // we are in an error state and we should decide to do a full rebuild.
+   this._loading = this._loading.finally(() => {
+     if (this._hasteMapError) {
+       console.warn(
+         'Rebuilding haste map to recover from error:\n' +
+         this._hasteMapError.stack
+       );
+       this._hasteMapError = null;
+
+       // Rebuild the entire map if last change resulted in an error.
+       this._loading = this._hasteMap.build();
+     } else {
+       this._loading = this._hasteMap.processFileChange(type, absPath);
+       this._loading.catch((e) => this._hasteMapError = e);
+     }
+     return this._loading;
+   });
+ }
+
 }
 
 function NotFoundError() {
@@ -437,31 +282,6 @@ function NotFoundError() {
   this.type = this.name = 'NotFoundError';
   this.status = 404;
 }
-
-function normalizePath(modulePath) {
-  if (path.sep === '/') {
-    modulePath = path.normalize(modulePath);
-  } else if (path.posix) {
-    modulePath = path.posix.normalize(modulePath);
-  }
-
-  return modulePath.replace(/\/$/, '');
-}
-
 util.inherits(NotFoundError, Error);
-
-function UnableToResolveError(fromModule, toModule, message) {
-  Error.call(this);
-  Error.captureStackTrace(this, this.constructor);
-  this.message = util.format(
-    'Unable to resolve module %s from %s: %s',
-    toModule,
-    fromModule.path,
-    message,
-  );
-  this.type = this.name = 'UnableToResolveError';
-}
-
-util.inherits(UnableToResolveError, Error);
 
 module.exports = DependencyGraph;
