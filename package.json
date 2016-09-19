@@ -18,10 +18,10 @@
     "absolute-path": "0.0.0",
     "chalk": "~1.1.1",
     "debug": "~2.2.0",
-    "fast-path": "~1.1.0",
-    "graceful-fs": "~4.1.2",
+    "denodeify": "~1.2.1",
+    "graceful-fs": "~4.1.3",
     "json-stable-stringify": "~1.0.1",
-    "promise": "~7.0.4",
+    "throat": "~2.0.2",
     "underscore": "~1.8.3"
   },
   "devDependencies": {

@@ -8,18 +8,14 @@
  */
 'use strict';
 
-const Promise = require('promise');
+const denodeify = require('denodeify');
 const {EventEmitter} = require('events');
 
 const fs = require('graceful-fs');
-const path = require('fast-path');
+const path = require('./fastpath');
 
-// workaround for https://github.com/isaacs/node-graceful-fs/issues/56
-// fs.close is patched, whereas graceful-fs.close is not.
-const fsClose = require('fs').close;
-
-const readFile = Promise.denodeify(fs.readFile);
-const stat = Promise.denodeify(fs.stat);
+const readFile = denodeify(fs.readFile);
+const stat = denodeify(fs.stat);
 
 const NOT_FOUND_IN_ROOTS = 'NotFoundInRootsError';
 
@@ -35,6 +31,9 @@ class Fastfs extends EventEmitter {
       if (root.endsWith(path.sep)) {
         root = root.substr(0, root.length - 1);
       }
+
+      root = path.resolve(root);
+
       return new File(root, true);
     });
     this._fastPaths = Object.create(null);
@@ -67,11 +66,10 @@ class Fastfs extends EventEmitter {
       if (activity) {
         activity.endEvent(fastfsActivity);
       }
-      // NOTE
+
       if (this._fileWatcher) {
         this._fileWatcher.on('all', this._processFileChange.bind(this));
       }
-
     });
   }
 
@@ -183,7 +181,7 @@ class Fastfs extends EventEmitter {
   }
 
   _getFile(filePath) {
-    filePath = path.normalize(filePath);
+    filePath = path.resolve(filePath);
     if (!this._fastPaths[filePath]) {
       const file = this._getAndAssertRoot(filePath).getFileFromPath(filePath);
       if (file) {
@@ -213,7 +211,7 @@ class Fastfs extends EventEmitter {
       }
     }
 
-    delete this._fastPaths[path.normalize(absPath)];
+    delete this._fastPaths[path.resolve(absPath)];
 
     if (type !== 'delete') {
       const file = new File(absPath, false);
@@ -335,7 +333,7 @@ function read(fd, buffer, callback) {
 }
 
 function close(fd, error, result, complete, callback) {
-  fsClose(fd, closeError => callback(error || closeError, result, complete));
+  fs.close(fd, closeError => callback(error || closeError, result, complete));
 }
 
 function makeReadCallback(fd, predicate, callback) {

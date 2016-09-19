@@ -10,11 +10,10 @@
 
 const assert = require('assert');
 const fs = require('fs');
-const path = require('path');
+const path = require('./fastpath');
 const Activity = require('./Activity');
 const Cache = require('./Cache');
 const DependencyGraph = require('./DependencyGraph');
-const Promise = require('promise');
 const Polyfill = require('./Polyfill');
 
 class Resolver {
@@ -69,11 +68,11 @@ class Resolver {
 
   getDependencies(main, options) {
 
-    return this._depGraph.getDependencies(
-      main,
-      options.platform,
-      options.recursive,
-    ).then(resolutionResponse => {
+    return this._depGraph.getDependencies({
+      entryPath: main,
+      platform: options.platform,
+      recursive: options.recursive,
+    }).then(resolutionResponse => {
       this._getPolyfillDependencies().reverse().forEach(
         polyfill => resolutionResponse.prependDependency(polyfill)
       );

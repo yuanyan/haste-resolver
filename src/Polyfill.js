@@ -1,13 +1,12 @@
 'use strict';
 
-const Promise = require('promise');
 const Module = require('./Module');
 
 class Polyfill extends Module {
-  constructor({ path, id, dependencies }) {
-    super({ file: path });
-    this._id = id;
-    this._dependencies = dependencies;
+  constructor(options) {
+    super(options);
+    this._id = options.id;
+    this._dependencies = options.dependencies;
   }
 
   isHaste() {
