@@ -7,12 +7,12 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 'use strict';
-const path = require('fast-path');
+const path = require('../fastpath');
 const getPlatformExtension = require('../utils/getPlatformExtension');
-const Promise = require('promise');
 
 const GENERIC_PLATFORM = 'generic';
 const NATIVE_PLATFORM = 'native';
+const PACKAGE_JSON = path.sep + 'package.json';
 
 class HasteMap {
   constructor({
@@ -39,7 +39,7 @@ class HasteMap {
         if (this._extensions.indexOf(path.extname(filePath).substr(1)) !== -1) {
           promises.push(this._processHasteModule(filePath));
         }
-        if (filePath.endsWith('/package.json')) {
+        if (filePath.endsWith(PACKAGE_JSON)) {
           promises.push(this._processHastePackage(filePath));
         }
       }
@@ -133,8 +133,11 @@ class HasteMap {
 
     if (existingModule && existingModule.path !== mod.path) {
       throw new Error(
-        `Naming collision detected: ${mod.path} ` +
-        `collides with ${existingModule.path}`
+        `@providesModule naming collision:\n` +
+        `  Duplicate module name: ${name}\n` +
+        `  Paths: ${mod.path} collides with ${existingModule.path}\n\n` +
+        `This error is caused by a @providesModule declaration ` +
+        `with the same name accross two different files.`
       );
     }
 

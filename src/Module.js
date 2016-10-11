@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const docblock = require('./DependencyGraph/docblock');
 const isAbsolutePath = require('absolute-path');
 const jsonStableStringify = require('json-stable-stringify');
-const path = require('fast-path');
+const path = require('./fastpath');
 const extractRequires = require('./utils/extractRequires');
 
 class Module {
@@ -133,24 +133,24 @@ class Module {
         return Promise.all([
           fileContentPromise,
           this._readDocBlock(fileContentPromise),
-        ]).then(([code, {id, moduleDocBlock}]) => {
+        ]).then(([source, {id, moduleDocBlock}]) => {
           // Ignore requires in JSON files or generated code. An example of this
           // is prebuilt files like the SourceMap library.
-          if (this.isJSON() || 'extern' in moduleDocBlock) {
-            return {id, code, dependencies: []};
-          } else {
-            const transformCode = this._transformCode;
-            const codePromise = transformCode
-                ? transformCode(this, code, transformOptions)
-                : Promise.resolve({code});
-
-            return codePromise.then(({code, dependencies, map}) => {
-              if (!dependencies) {
-                dependencies = this._extractor(code).deps.sync;
-              }
-              return {id, code, dependencies, map};
-            });
+          const extern = this.isJSON() || 'extern' in moduleDocBlock;
+          if (extern) {
+            transformOptions = {...transformOptions, extern};
           }
+          const transformCode = this._transformCode;
+          const codePromise = transformCode
+              ? transformCode(this, source, transformOptions)
+              : Promise.resolve({code: source});
+          return codePromise.then(result => {
+            const {
+              code,
+              dependencies = extern ? [] : this._extractor(code).deps.sync,
+            } = result;
+            return {...result, dependencies, id, source};
+          });
         });
       }
     );

@@ -10,11 +10,10 @@
 
 const Fastfs = require('../fastfs');
 const ModuleCache = require('../ModuleCache');
-const Promise = require('promise');
 const crawl = require('../crawlers');
 const getPlatformExtension = require('../utils/getPlatformExtension');
 const isAbsolutePath = require('absolute-path');
-const path = require('fast-path');
+const path = require('../fastpath');
 const util = require('util');
 const DependencyGraphHelpers = require('./DependencyGraphHelpers');
 const ResolutionRequest = require('./ResolutionRequest');
@@ -158,8 +157,10 @@ class DependencyGraph {
   * Returns a promise with the direct dependencies the module associated to
   * the given entryPath has.
   */
- getShallowDependencies(entryPath) {
-   return this._moduleCache.getModule(entryPath).getDependencies();
+ getShallowDependencies(entryPath, transformOptions) {
+   return this._moduleCache
+     .getModule(entryPath)
+     .getDependencies(transformOptions);
  }
 
  getFS() {
@@ -177,10 +178,16 @@ class DependencyGraph {
    return this.load().then(() => this._moduleCache.getAllModules());
  }
 
- getDependencies(entryPath, platform, recursive = true) {
+ getDependencies({
+   entryPath,
+   platform,
+   transformOptions,
+   onProgress,
+   recursive = true,
+ }) {
    return this.load().then(() => {
      platform = this._getRequestPlatform(entryPath, platform);
-     const absPath = this._getAbsolutePath(entryPath);
+     const absPath = path.resolve(entryPath);
      const req = new ResolutionRequest({
        platform,
        preferNativePlatform: this._opts.preferNativePlatform,
@@ -193,13 +200,15 @@ class DependencyGraph {
        shouldThrowOnUnresolvedErrors: this._opts.shouldThrowOnUnresolvedErrors,
      });
 
-     const response = new ResolutionResponse();
+     const response = new ResolutionResponse({transformOptions});
 
-     return req.getOrderedDependencies(
+     return req.getOrderedDependencies({
        response,
-       this._opts.mocksPattern,
+       mocksPattern: this._opts.mocksPattern,
+       transformOptions,
+       onProgress,
        recursive,
-     ).then(() => response);
+     }).then(() => response);
    });
  }
 
@@ -254,7 +263,7 @@ class DependencyGraph {
    // After we process a file change we record any errors which will also be
    // reported via the next request. On the next file change, we'll see that
    // we are in an error state and we should decide to do a full rebuild.
-   this._loading = this._loading.finally(() => {
+   const resolve = () => {
      if (this._hasteMapError) {
        console.warn(
          'Rebuilding haste map to recover from error:\n' +
@@ -269,9 +278,13 @@ class DependencyGraph {
        this._loading.catch((e) => this._hasteMapError = e);
      }
      return this._loading;
-   });
+   };
+   this._loading = this._loading.then(resolve, resolve);
  }
 
+ createPolyfill(options) {
+   return this._moduleCache.createPolyfill(options);
+ }
 }
 
 function NotFoundError() {

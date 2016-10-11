@@ -8,11 +8,11 @@
  */
 'use strict';
 
-const Promise = require('promise');
+const denodeify = require('denodeify');
+const crypto = require('crypto');
 const fs = require('graceful-fs');
-const getCacheFilePath = require('./utils/getCacheFilePath');
 const isAbsolutePath = require('absolute-path');
-const loadCacheSync = require('./utils/loadCacheSync');
+const path = require('../fastpath');
 const tmpDir = require('os').tmpDir();
 
 function getObjectValues(object) {
@@ -33,17 +33,20 @@ class Cache {
     cacheKey,
     cacheDirectory = tmpDir,
   }) {
-    this._cacheFilePath = getCacheFilePath(cacheDirectory, cacheKey);
+    this._cacheFilePath = Cache.getCacheFilePath(cacheDirectory, cacheKey);
     if (!resetCache) {
       this._data = this._loadCacheSync(this._cacheFilePath);
     } else {
       this._data = Object.create(null);
     }
 
-    this._persistEventually = debounce(
-      this._persistCache.bind(this),
-      2000,
-    );
+    this._persistEventually = debounce(this._persistCache.bind(this), 2000);
+  }
+
+  static getCacheFilePath(tmpdir, ...args) {
+    const hash = crypto.createHash('md5');
+    args.forEach(arg => hash.update(arg));
+    return path.join(tmpdir, hash.digest('hex'));
   }
 
   get(filepath, field, loaderCb) {
@@ -87,7 +90,7 @@ class Cache {
     record.data[field] = loaderPromise
       .then(data => Promise.all([
         data,
-        Promise.denodeify(fs.stat)(filepath),
+        denodeify(fs.stat)(filepath),
       ]))
       .then(([data, stat]) => {
         this._persistEventually();
@@ -149,7 +152,7 @@ class Cache {
           json[key].metadata = data[key].metadata;
           json[key].data = value.data;
         });
-        return Promise.denodeify(fs.writeFile)(cacheFilepath, JSON.stringify(json));
+        return denodeify(fs.writeFile)(cacheFilepath, JSON.stringify(json));
       })
       .catch(e => console.error('Error while persisting cache:', e.message))
       .then(() => {
@@ -184,6 +187,27 @@ class Cache {
     });
 
     return ret;
+  }
+}
+
+function loadCacheSync(cachePath) {
+  if (!fs.existsSync(cachePath)) {
+    return Object.create(null);
+  }
+
+  try {
+    return JSON.parse(fs.readFileSync(cachePath));
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      console.warn('Unable to parse cache file. Will clear and continue.');
+      try {
+        fs.unlinkSync(cachePath);
+      } catch (err) {
+        // Someone else might've deleted it.
+      }
+      return Object.create(null);
+    }
+    throw e;
   }
 }
 

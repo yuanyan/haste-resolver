@@ -8,7 +8,9 @@
  */
 'use strict';
 
-const path = require('fast-path');
+const path = require('../fastpath');
+
+const NODE_MODULES = path.sep + 'node_modules' + path.sep;
 
 class DependencyGraphHelpers {
   constructor({ providesModuleNodeModules, assetExts }) {
@@ -17,7 +19,7 @@ class DependencyGraphHelpers {
   }
 
   isNodeModulesDir(file) {
-    const index = file.lastIndexOf('/node_modules/');
+    const index = file.lastIndexOf(NODE_MODULES);
     if (index === -1) {
       return false;
     }
